@@ -32,11 +32,11 @@ import java.util.Map;
 import java.util.PriorityQueue;
 
 /**
- * AutoDungeon v1.2 (Minecraft 1.21.11, Fabric/Yarn)
- *  - A* path-finding around walls (steps up 1, drops up to 3, diagonals)
- *  - Activity area (centre + radius): ignores targets outside, returns to centre when idle
- *  - Settings GUI (K), auto mode (G), continuous right-click toggle (J)
- *  - Built-in attack is OFF by default so Wurst KillAura can do the hitting
+ * AutoDungeon v1.3 (Minecraft 1.21.11, Fabric/Yarn)
+ *  - Record your own route (H), then auto mode (G) walks it again and again.
+ *  - On the way: monsters are fought (Wurst KillAura or built-in), items are picked up.
+ *  - A* path-finding around walls between waypoints.
+ *  - Continuous right-click (J), settings GUI (K), background running.
  */
 public class AutoDungeonClient implements ClientModInitializer {
 
@@ -57,12 +57,27 @@ public class AutoDungeonClient implements ClientModInitializer {
     private static final int[] DY_ALL = {0, 1, -1, -2, -3};
     private static final int[] DY_FLAT = {0};
 
-    private static KeyBinding toggleKey, guiKey, holdKey;
+    private static KeyBinding toggleKey, guiKey, holdKey, recKey;
 
     private boolean enabled = false;
+    private boolean recording = false;
     private boolean useHeld = false;
+    private int useTimer = 0;
     private int tickCount = 0;
     private int hudTimer = 0;
+
+    // background mode
+    private boolean pauseSaved = false;
+    private boolean savedPause = true;
+
+    // route following
+    private int routeIdx = 0;
+    private int routeDir = 1;
+    private boolean blind = false;
+    private int blindUntil = 0;
+    private int routeWaitUntil = 0;
+    private int routeFailStreak = 0;
+    private boolean skipWaypoint = false;
 
     // path state
     private List<BlockPos> path = null;
@@ -91,6 +106,7 @@ public class AutoDungeonClient implements ClientModInitializer {
     }
 
     boolean isEnabled() { return enabled; }
+    boolean isRecording() { return recording; }
 
     @Override
     public void onInitializeClient() {
@@ -103,19 +119,33 @@ public class AutoDungeonClient implements ClientModInitializer {
                 "key.autodungeon.gui", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, cat));
         holdKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.autodungeon.hold_use", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_J, cat));
+        recKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.autodungeon.record", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_H, cat));
         ClientTickEvents.END_CLIENT_TICK.register(this::onTick);
     }
 
+    // =====================================================================
+    //  Switches
+    // =====================================================================
     void setEnabled(MinecraftClient mc, boolean v) {
+        if (v && recording) setRecording(mc, false);
         enabled = v;
         path = null;
         blacklist.clear();
         checkpoint = null;
         unstickTicks = 0;
         stuckStreak = 0;
+        blind = false;
+        skipWaypoint = false;
+        routeFailStreak = 0;
+        routeWaitUntil = 0;
         if (v) {
             ClientPlayerEntity p = mc.player;
-            if (p != null && Config.limitArea) {
+            if (p != null && Config.routeMode && !Config.route.isEmpty()) {
+                routeIdx = nearestWaypoint(posOf(p));
+                routeDir = 1;
+                chat(mc, "[AutoDungeon] Enabled  路线模式 " + Config.route.size() + " 个路点,从第 " + (routeIdx + 1) + " 个开始");
+            } else if (p != null && Config.limitArea) {
                 Config.areaX = p.getX();
                 Config.areaY = p.getY();
                 Config.areaZ = p.getZ();
@@ -131,13 +161,42 @@ public class AutoDungeonClient implements ClientModInitializer {
         }
     }
 
+    void setRecording(MinecraftClient mc, boolean v) {
+        if (v == recording) return;
+        if (v) {
+            if (enabled) setEnabled(mc, false);
+            Config.route.clear();
+            recording = true;
+            chat(mc, "[AutoDungeon] 开始录制路线:请沿着路线走,走完再按 H 结束");
+        } else {
+            recording = false;
+            Config.saveRoute();
+            chat(mc, "[AutoDungeon] 路线已保存,共 " + Config.route.size() + " 个路点");
+        }
+    }
+
+    private int nearestWaypoint(Vec3d from) {
+        int best = 0;
+        double bd = Double.MAX_VALUE;
+        for (int i = 0; i < Config.route.size(); i++) {
+            double d = Config.route.get(i).squaredDistanceTo(from);
+            if (d < bd) {
+                bd = d;
+                best = i;
+            }
+        }
+        return best;
+    }
+
     // =====================================================================
     //  Main tick
     // =====================================================================
     private void onTick(MinecraftClient mc) {
         tickCount++;
+        applyBackground(mc);
 
         while (toggleKey.wasPressed()) setEnabled(mc, !enabled);
+        while (recKey.wasPressed()) setRecording(mc, !recording);
         while (holdKey.wasPressed()) {
             Config.holdUse = !Config.holdUse;
             Config.save();
@@ -153,14 +212,18 @@ public class AutoDungeonClient implements ClientModInitializer {
             return;
         }
 
-        // Background mode: when the window loses focus Minecraft opens the pause menu
-        // (which would stop us). Close it again so the bot keeps running.
-        if (Config.background && (enabled || Config.holdUse) && !mc.isWindowFocused()
+        // Backup for background mode: if the pause menu still pops up, close it again.
+        if (Config.background && (enabled || Config.holdUse || recording) && !mc.isWindowFocused()
                 && mc.currentScreen instanceof GameMenuScreen) {
             mc.setScreen(null);
         }
 
         updateHoldUse(mc, p);
+
+        if (recording) {
+            if (mc.currentScreen == null) recordStep(p);
+            return;
+        }
 
         if (!enabled) return;
         if (!p.isAlive()) {
@@ -205,7 +268,13 @@ public class AutoDungeonClient implements ClientModInitializer {
             }
         }
 
-        // ---- 3) return to the centre of the area ----
+        // ---- 3) follow the recorded route ----
+        if (Config.routeMode && !Config.route.isEmpty()) {
+            followRoute(mc, p);
+            return;
+        }
+
+        // ---- 4) (no route) return to the centre of the area ----
         if (Config.limitArea && tickCount >= centerFailUntil) {
             Vec3d c = new Vec3d(Config.areaX, Config.areaY, Config.areaZ);
             if (hdist(posOf(p), c) > RETURN_DIST) {
@@ -220,27 +289,145 @@ public class AutoDungeonClient implements ClientModInitializer {
         }
 
         releaseMovement(mc);
-        hud(p, "等待目标...");
+        hud(p, Config.routeMode ? "未录制路线,按 H 录制" : "等待目标...");
+    }
+
+    // =====================================================================
+    //  Background mode
+    // =====================================================================
+    /** Turn off "pause on lost focus" while the bot is active, restore it afterwards. */
+    private void applyBackground(MinecraftClient mc) {
+        boolean need = Config.background && (enabled || Config.holdUse || recording);
+        if (need) {
+            if (!pauseSaved) {
+                savedPause = mc.options.pauseOnLostFocus;
+                pauseSaved = true;
+            }
+            mc.options.pauseOnLostFocus = false;
+        } else if (pauseSaved) {
+            mc.options.pauseOnLostFocus = savedPause;
+            pauseSaved = false;
+        }
     }
 
     // =====================================================================
     //  Continuous right-click (works even when auto mode is off)
     // =====================================================================
     private void updateHoldUse(MinecraftClient mc, ClientPlayerEntity p) {
-        boolean want = Config.holdUse && p.isAlive() && mc.currentScreen == null
+        boolean active = Config.holdUse && p.isAlive() && mc.currentScreen == null
                 && (!Config.useOnlyWhenMobs || hasMobWithin(mc, p, Config.skillRange));
-        if (want) {
-            mc.options.useKey.setPressed(true);
-            useHeld = true;
-        } else if (useHeld) {
+
+        if (Config.useViaKey) {                       // mode A: hold the use key
+            if (active) {
+                mc.options.useKey.setPressed(true);
+                useHeld = true;
+            } else if (useHeld) {
+                mc.options.useKey.setPressed(false);
+                useHeld = false;
+            }
+            return;
+        }
+
+        if (useHeld) {                                // switched away from key mode
             mc.options.useKey.setPressed(false);
             useHeld = false;
         }
+        if (!active) {                                // mode B: send use-item every N ticks
+            useTimer = 0;
+            return;
+        }
+        if (--useTimer > 0) return;
+        useTimer = Math.max(1, (int) Math.round(Config.useInterval));
+        if (p.getMainHandStack().isEmpty() || p.isUsingItem()) return;
+        mc.interactionManager.interactItem(p, Hand.MAIN_HAND);
     }
 
     private boolean hasMobWithin(MinecraftClient mc, ClientPlayerEntity p, double r) {
         return !mc.world.getEntitiesByClass(MobEntity.class, p.getBoundingBox().expand(r),
                 e -> e instanceof Monster && e.isAlive() && p.distanceTo(e) <= r).isEmpty();
+    }
+
+    // =====================================================================
+    //  Route recording / following
+    // =====================================================================
+    private void recordStep(ClientPlayerEntity p) {
+        Vec3d now = posOf(p);
+        List<Vec3d> r = Config.route;
+        if (p.isOnGround()) {
+            if (r.isEmpty()) {
+                r.add(now);
+            } else {
+                Vec3d last = r.get(r.size() - 1);
+                if (hdist(now, last) >= Config.recordSpacing || Math.abs(now.y - last.y) >= 1.5) r.add(now);
+            }
+        }
+        hud(p, "录制中...  路点 " + r.size());
+    }
+
+    private boolean reached(ClientPlayerEntity p, Vec3d wp) {
+        return hdist(posOf(p), wp) <= Config.routeReach && Math.abs(p.getY() - wp.y) <= 3.0;
+    }
+
+    private void advanceWaypoint() {
+        int n = Config.route.size();
+        if (n == 0) return;
+        if (Config.routeLoop) {
+            routeIdx = (routeIdx + 1) % n;
+        } else {
+            int next = routeIdx + routeDir;
+            if (next < 0 || next >= n) {
+                routeDir = -routeDir;
+                next = routeIdx + routeDir;
+            }
+            routeIdx = MathHelper.clamp(next, 0, n - 1);
+        }
+        path = null;
+        blind = false;
+    }
+
+    private void followRoute(MinecraftClient mc, ClientPlayerEntity p) {
+        List<Vec3d> r = Config.route;
+        int n = r.size();
+        if (routeIdx >= n) routeIdx = 0;
+
+        if (tickCount < routeWaitUntil) {
+            releaseMovement(mc);
+            return;
+        }
+        if (skipWaypoint) {
+            skipWaypoint = false;
+            advanceWaypoint();
+        }
+
+        Vec3d wp = r.get(routeIdx);
+        if (reached(p, wp)) {
+            routeFailStreak = 0;
+            advanceWaypoint();
+            wp = r.get(routeIdx);
+        }
+        hud(p, String.format("路线 %d/%d  距离 %.1f", routeIdx + 1, n, hdist(posOf(p), wp)));
+
+        if (blind) {
+            if (tickCount < blindUntil) {                 // walk straight at it for a short while
+                movedThisWindow = true;
+                navEntityId = -1;
+                moveToward(mc, p, wp, wp.y > p.getY() + 0.6);
+                return;
+            }
+            advanceWaypoint();                            // could not get there: skip this waypoint
+            if (++routeFailStreak >= n) {
+                routeFailStreak = 0;
+                routeWaitUntil = tickCount + 60;
+            }
+            return;
+        }
+
+        BlockPos wb = new BlockPos(MathHelper.floor(wp.x), MathHelper.floor(wp.y), MathHelper.floor(wp.z));
+        if (!navigate(mc, p, wb, wp, -1)) {
+            blind = true;                                 // A* found no way: try walking straight
+            blindUntil = tickCount + 30;
+            path = null;
+        }
     }
 
     // =====================================================================
@@ -263,6 +450,7 @@ public class AutoDungeonClient implements ClientModInitializer {
 
     private boolean inArea(Vec3d v) {
         if (!Config.limitArea) return true;
+        if (Config.routeMode && !Config.route.isEmpty()) return true;   // route mode: no area limit
         double dx = v.x - Config.areaX;
         double dz = v.z - Config.areaZ;
         return Math.sqrt(dx * dx + dz * dz) <= Config.areaRadius
@@ -402,7 +590,6 @@ public class AutoDungeonClient implements ClientModInitializer {
         return true;
     }
 
-    /** Feet and head free, solid block underneath. */
     private boolean standable(ClientWorld w, int x, int y, int z) {
         return passable(w, x, y, z) && passable(w, x, y + 1, z) && hasGround(w, x, y - 1, z);
     }
@@ -438,7 +625,6 @@ public class AutoDungeonClient implements ClientModInitializer {
             p.setYaw(approach(p.getYaw(), wantYaw));
             fwd = Math.abs(MathHelper.wrapDegrees(wantYaw - p.getYaw())) < 50.0F;
         } else {
-            // camera stays where the player looks: move with W/A/S/D relative to the view
             float rel = MathHelper.wrapDegrees(wantYaw - p.getYaw());
             float a = Math.abs(rel);
             fwd = a < 67.5F;
@@ -473,8 +659,9 @@ public class AutoDungeonClient implements ClientModInitializer {
             strafeRight = !strafeRight;
             path = null;
             stuckStreak++;
-            if (stuckStreak >= 3 && navEntityId >= 0) {
-                blacklist.put(navEntityId, tickCount + 200);
+            if (stuckStreak >= 3) {
+                if (navEntityId >= 0) blacklist.put(navEntityId, tickCount + 200);
+                else skipWaypoint = true;
                 stuckStreak = 0;
             }
         } else if (movedThisWindow) {
@@ -528,7 +715,7 @@ public class AutoDungeonClient implements ClientModInitializer {
         if (mc.inGameHud != null) mc.inGameHud.getChatHud().addMessage(Text.literal(msg));
     }
 
-    /** Releases movement keys only; the right-click key is managed by updateHoldUse. */
+    /** Releases movement keys only; the right-click is handled by updateHoldUse. */
     private void releaseMovement(MinecraftClient mc) {
         GameOptions o = mc.options;
         o.forwardKey.setPressed(false);

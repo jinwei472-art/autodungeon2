@@ -11,8 +11,9 @@ import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 import java.util.function.DoubleSupplier;
 
-/** Settings screen (press K in game). Two columns of buttons; numbers use - / + buttons. */
+/** Settings screen (press K). Two pages; numbers use - / + buttons. */
 public class ConfigScreen extends Screen {
+    private static int page = 0;
     private int slot = 0;
 
     public ConfigScreen() {
@@ -22,40 +23,60 @@ public class ConfigScreen extends Screen {
     @Override
     protected void init() {
         slot = 0;
+        if (page == 0) {
+            toggle("自动模式",
+                    () -> AutoDungeonClient.instance != null && AutoDungeonClient.instance.isEnabled(),
+                    v -> { if (AutoDungeonClient.instance != null) AutoDungeonClient.instance.setEnabled(client, v); });
+            toggle("持续右键", () -> Config.holdUse, v -> Config.holdUse = v);
 
-        toggle("自动模式",
-                () -> AutoDungeonClient.instance != null && AutoDungeonClient.instance.isEnabled(),
-                v -> { if (AutoDungeonClient.instance != null) AutoDungeonClient.instance.setEnabled(client, v); });
-        toggle("持续右键", () -> Config.holdUse, v -> Config.holdUse = v);
+            number("右键间隔", () -> Config.useInterval, v -> Config.useInterval = v, 1, 1, 20);
+            toggle("右键用按键模式", () -> Config.useViaKey, v -> Config.useViaKey = v);
 
-        toggle("仅怪物附近右键", () -> Config.useOnlyWhenMobs, v -> Config.useOnlyWhenMobs = v);
-        number("技能触发距离", () -> Config.skillRange, v -> Config.skillRange = v, 0.5, 1, 20);
+            toggle("仅怪物附近右键", () -> Config.useOnlyWhenMobs, v -> Config.useOnlyWhenMobs = v);
+            number("技能距离", () -> Config.skillRange, v -> Config.skillRange = v, 0.5, 1, 20);
 
-        number("怪物搜索范围", () -> Config.scanRange, v -> Config.scanRange = v, 1, 2, 40);
-        number("靠近距离", () -> Config.approachDist, v -> Config.approachDist = v, 0.5, 1, 6);
+            number("搜索范围", () -> Config.scanRange, v -> Config.scanRange = v, 1, 2, 40);
+            number("靠近距离", () -> Config.approachDist, v -> Config.approachDist = v, 0.5, 1, 6);
 
-        toggle("限制活动区域", () -> Config.limitArea, v -> Config.limitArea = v);
-        number("活动半径", () -> Config.areaRadius, v -> Config.areaRadius = v, 1, 3, 60);
+            toggle("内置攻击", () -> Config.builtinAttack, v -> Config.builtinAttack = v);
+            toggle("自动转向", () -> Config.autoFace, v -> Config.autoFace = v);
 
-        action("设当前位置为中心", () -> {
-            ClientPlayerEntity p = client == null ? null : client.player;
-            if (p != null) {
-                Config.areaX = p.getX();
-                Config.areaY = p.getY();
-                Config.areaZ = p.getZ();
-                Config.save();
-            }
-        });
-        toggle("自动捡物", () -> Config.autoLoot, v -> Config.autoLoot = v);
+            toggle("后台运行", () -> Config.background, v -> Config.background = v);
+        } else {
+            toggle("路线模式", () -> Config.routeMode, v -> Config.routeMode = v);
+            toggle("录制路线",
+                    () -> AutoDungeonClient.instance != null && AutoDungeonClient.instance.isRecording(),
+                    v -> { if (AutoDungeonClient.instance != null) AutoDungeonClient.instance.setRecording(client, v); });
 
-        number("捡物范围", () -> Config.lootRange, v -> Config.lootRange = v, 1, 1, 20);
-        toggle("内置攻击", () -> Config.builtinAttack, v -> Config.builtinAttack = v);
+            toggle("循环(关=往返)", () -> Config.routeLoop, v -> Config.routeLoop = v);
+            action("清空路线", () -> { Config.route.clear(); Config.saveRoute(); });
 
-        toggle("自动转向", () -> Config.autoFace, v -> Config.autoFace = v);
-        toggle("后台运行", () -> Config.background, v -> Config.background = v);
+            number("路点间距", () -> Config.recordSpacing, v -> Config.recordSpacing = v, 0.5, 1, 10);
+            number("到点半径", () -> Config.routeReach, v -> Config.routeReach = v, 0.5, 0.5, 4);
 
+            toggle("限制活动区域", () -> Config.limitArea, v -> Config.limitArea = v);
+            number("活动半径", () -> Config.areaRadius, v -> Config.areaRadius = v, 1, 3, 60);
+
+            action("设当前位置为中心", () -> {
+                ClientPlayerEntity p = client == null ? null : client.player;
+                if (p != null) {
+                    Config.areaX = p.getX();
+                    Config.areaY = p.getY();
+                    Config.areaZ = p.getZ();
+                    Config.save();
+                }
+            });
+            toggle("自动捡物", () -> Config.autoLoot, v -> Config.autoLoot = v);
+
+            number("捡物范围", () -> Config.lootRange, v -> Config.lootRange = v, 1, 1, 20);
+        }
+
+        addDrawableChild(ButtonWidget.builder(Text.literal("切换页面 (" + (page + 1) + "/2)"), b -> {
+            page = (page + 1) % 2;
+            client.setScreen(new ConfigScreen());
+        }).dimensions(width / 2 - 155, height - 26, 150, 20).build());
         addDrawableChild(ButtonWidget.builder(Text.literal("完成"), b -> close())
-                .dimensions(width / 2 - 100, height - 26, 200, 20).build());
+                .dimensions(width / 2 + 5, height - 26, 150, 20).build());
     }
 
     // ---------- layout helpers ----------
@@ -117,7 +138,8 @@ public class ConfigScreen extends Screen {
     public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
         super.render(ctx, mouseX, mouseY, delta);
         ctx.drawTextWithShadow(textRenderer, title, width / 2 - textRenderer.getWidth(title) / 2, 8, 0xFFFFFFFF);
-        String c = String.format("活动中心: %.0f, %.0f, %.0f", Config.areaX, Config.areaY, Config.areaZ);
+        String c = String.format("路点: %d   区域中心: %.0f, %.0f, %.0f",
+                Config.route.size(), Config.areaX, Config.areaY, Config.areaZ);
         ctx.drawTextWithShadow(textRenderer, Text.literal(c), width / 2 - textRenderer.getWidth(c) / 2, 20, 0xFFAAAAAA);
     }
 }

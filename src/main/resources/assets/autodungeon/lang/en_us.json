@@ -2,5 +2,6 @@
   "key.autodungeon.toggle": "自动模式开关",
   "key.autodungeon.gui": "打开设置界面",
   "key.autodungeon.hold_use": "持续右键开关",
+  "key.autodungeon.record": "录制路线开关",
   "key.category.autodungeon.main": "AutoDungeon"
 }
