@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "autodungeon",
+  "version": "${version}",
+  "name": "AutoDungeon",
+  "description": "Client-side hunter: chase monsters, loot items, dash with main-hand weapon.",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": { "client": ["com.example.autodungeon.AutoDungeonClient"] },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
